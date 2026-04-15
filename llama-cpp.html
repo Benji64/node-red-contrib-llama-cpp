@@ -1,0 +1,573 @@
+<script type="text/javascript">
+  RED.nodes.registerType("llama-cpp", {
+    category: "AI",
+    color: "#a0c8e0",
+    defaults: {
+      name:          { value: "" },
+      mode:          { value: "completion" },
+      // Model
+      modelPath:     { value: "", required: true },
+      llamaBinary:   { value: "llama-server" },
+      alias:         { value: "" },
+      // Server
+      serverPort:    { value: 8080,      validate: RED.validators.number() },
+      host:          { value: "127.0.0.1" },
+      nSlots:        { value: 1,         validate: RED.validators.number() },
+      contBatching:  { value: true },
+      noMmap:        { value: false },
+      mlock:         { value: false },
+      noWarmup:      { value: false },
+      flashAttn:     { value: false },
+      // Context
+      contextSize:   { value: 2048,  validate: RED.validators.number() },
+      batchSize:     { value: 512,   validate: RED.validators.number() },
+      ubatchSize:    { value: 512,   validate: RED.validators.number() },
+      noCtxShift:    { value: false },
+      // Threads
+      threads:       { value: -1,    validate: RED.validators.number() },
+      threadsBatch:  { value: -1,    validate: RED.validators.number() },
+      // GPU
+      ngl:           { value: 0,     validate: RED.validators.number() },
+      splitMode:     { value: "" },
+      mainGpu:       { value: "" },
+      tensorSplit:   { value: "" },
+      // Sampling
+      temperature:   { value: 0.8 },
+      maxTokens:     { value: 512,   validate: RED.validators.number() },
+      topK:          { value: 40,    validate: RED.validators.number() },
+      topP:          { value: 0.95 },
+      minP:          { value: 0.05 },
+      repeatPenalty: { value: 1.1 },
+      repeatLastN:   { value: 64,    validate: RED.validators.number() },
+      seed:          { value: -1,    validate: RED.validators.number() },
+      mirostat:      { value: 0,     validate: RED.validators.number() },
+      mirostatTau:   { value: 5.0 },
+      mirostatEta:   { value: 0.1 },
+      // Chat
+      chatTemplate:  { value: "" },
+      systemPrompt:  { value: "" },
+      debugTrace:    { value: false }
+    },
+    inputs: 1,
+    outputs: 2,
+    icon: "font-awesome/fa-microchip",
+    label: function () { return this.name || "llama.cpp"; },
+    paletteLabel: "llama.cpp"
+  });
+</script>
+
+<script type="text/html" data-template-name="llama-cpp">
+
+  <!-- ── Identification ─────────────────────────────────── -->
+  <div class="form-row">
+    <label for="node-input-name"><i class="fa fa-tag"></i> Nom</label>
+    <input type="text" id="node-input-name" placeholder="llama.cpp">
+  </div>
+  <div class="form-row">
+    <label for="node-input-mode"><i class="fa fa-exchange"></i> Mode</label>
+    <select id="node-input-mode" style="width:65%">
+      <option value="completion">completion — /completion (simple, défaut)</option>
+      <option value="chat">chat — /v1/chat/completions (format OpenAI + serveur MCP)</option>
+      <option value="mcp-client">mcp-client — orchestration d'appels d'outils</option>
+    </select>
+  </div>
+
+  <!-- ── Model ─────────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px"><b>Modèle</b></div>
+
+  <div class="form-row">
+    <label for="node-input-modelPath"><i class="fa fa-file"></i> Chemin modèle</label>
+    <input type="text" id="node-input-modelPath" placeholder="/path/to/model.gguf" style="width:65%">
+  </div>
+  <div class="form-row">
+    <label for="node-input-llamaBinary"><i class="fa fa-terminal"></i> Binaire</label>
+    <input type="text" id="node-input-llamaBinary" placeholder="llama-server" style="width:50%">
+    <span style="color:#888;font-size:.85em;margin-left:6px">chemin complet si hors $PATH</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-alias"><i class="fa fa-bookmark"></i> Alias</label>
+    <input type="text" id="node-input-alias" placeholder="mon-modele" style="width:50%">
+    <span style="color:#888;font-size:.85em;margin-left:6px">optionnel</span>
+  </div>
+
+  <!-- ── Server ────────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>Serveur</b></div>
+
+  <div class="form-row">
+    <label for="node-input-serverPort"><i class="fa fa-plug"></i> Port</label>
+    <input type="number" id="node-input-serverPort" style="width:100px">
+  </div>
+  <div class="form-row">
+    <label for="node-input-host"><i class="fa fa-globe"></i> Host</label>
+    <input type="text" id="node-input-host" style="width:150px">
+  </div>
+  <div class="form-row">
+    <label for="node-input-nSlots"><i class="fa fa-clone"></i> Slots parallèles</label>
+    <input type="number" id="node-input-nSlots" style="width:80px" min="1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">-np : requêtes simultanées</span>
+  </div>
+  <div class="form-row">
+    <label style="width:auto;margin-right:12px">
+      <input type="checkbox" id="node-input-contBatching" style="width:auto;margin-right:6px">
+      Continuous batching <span style="color:#888;font-size:.85em">(-cb, défaut: activé)</span>
+    </label>
+  </div>
+  <div class="form-row">
+    <label style="width:auto;margin-right:12px">
+      <input type="checkbox" id="node-input-flashAttn" style="width:auto;margin-right:6px">
+      Flash Attention <span style="color:#888;font-size:.85em">(-fa)</span>
+    </label>
+  </div>
+  <div class="form-row">
+    <label style="width:auto;margin-right:12px">
+      <input type="checkbox" id="node-input-mlock" style="width:auto;margin-right:6px">
+      mlock <span style="color:#888;font-size:.85em">(verrouiller le modèle en RAM)</span>
+    </label>
+    &nbsp;&nbsp;
+    <label style="width:auto;margin-right:12px">
+      <input type="checkbox" id="node-input-noMmap" style="width:auto;margin-right:6px">
+      Désactiver mmap
+    </label>
+    &nbsp;&nbsp;
+    <label style="width:auto">
+      <input type="checkbox" id="node-input-noWarmup" style="width:auto;margin-right:6px">
+      Pas de warmup
+    </label>
+  </div>
+
+  <!-- ── Context ───────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>Contexte</b></div>
+
+  <div class="form-row">
+    <label for="node-input-contextSize"><i class="fa fa-align-left"></i> Context (-c)</label>
+    <input type="number" id="node-input-contextSize" style="width:100px">
+    <span style="color:#888;font-size:.85em;margin-left:6px">tokens</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-batchSize"><i class="fa fa-list"></i> Batch size (-b)</label>
+    <input type="number" id="node-input-batchSize" style="width:100px">
+  </div>
+  <div class="form-row">
+    <label for="node-input-ubatchSize"><i class="fa fa-list-ul"></i> μBatch size (-ub)</label>
+    <input type="number" id="node-input-ubatchSize" style="width:100px">
+  </div>
+  <div class="form-row">
+    <label style="width:auto">
+      <input type="checkbox" id="node-input-noCtxShift" style="width:auto;margin-right:6px">
+      Désactiver context shift
+    </label>
+  </div>
+
+  <!-- ── Threads ───────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>CPU / Threads</b></div>
+
+  <div class="form-row">
+    <label for="node-input-threads"><i class="fa fa-cogs"></i> Threads inférence</label>
+    <input type="number" id="node-input-threads" style="width:80px" min="-1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">-1 = auto</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-threadsBatch"><i class="fa fa-cog"></i> Threads batch</label>
+    <input type="number" id="node-input-threadsBatch" style="width:80px" min="-1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">-1 = même que threads</span>
+  </div>
+
+  <!-- ── GPU ───────────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>GPU</b></div>
+
+  <div class="form-row">
+    <label for="node-input-ngl"><i class="fa fa-rocket"></i> GPU layers (-ngl)</label>
+    <input type="number" id="node-input-ngl" style="width:80px">
+    <span style="color:#888;font-size:.85em;margin-left:6px">0 = CPU, -1 = tout</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-splitMode"><i class="fa fa-share-alt"></i> Split mode</label>
+    <select id="node-input-splitMode" style="width:150px">
+      <option value="">-- désactivé --</option>
+      <option value="none">none</option>
+      <option value="layer">layer</option>
+      <option value="row">row</option>
+    </select>
+    <span style="color:#888;font-size:.85em;margin-left:6px">multi-GPU</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-mainGpu"><i class="fa fa-desktop"></i> GPU principal</label>
+    <input type="number" id="node-input-mainGpu" style="width:60px" min="0" placeholder="-">
+  </div>
+  <div class="form-row">
+    <label for="node-input-tensorSplit"><i class="fa fa-tasks"></i> Tensor split</label>
+    <input type="text" id="node-input-tensorSplit" style="width:150px" placeholder="ex: 3,1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">proportions par GPU</span>
+  </div>
+
+  <!-- ── Sampling ──────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>Sampling (défauts)</b></div>
+
+  <div class="form-row">
+    <label for="node-input-maxTokens"><i class="fa fa-list-ol"></i> Max tokens</label>
+    <input type="number" id="node-input-maxTokens" style="width:100px">
+  </div>
+  <div class="form-row">
+    <label for="node-input-temperature"><i class="fa fa-thermometer-half"></i> Temperature</label>
+    <input type="number" id="node-input-temperature" style="width:80px" step="0.05" min="0" max="2">
+  </div>
+  <div class="form-row">
+    <label for="node-input-topK"><i class="fa fa-sort-amount-asc"></i> Top-K</label>
+    <input type="number" id="node-input-topK" style="width:80px" min="0">
+    <span style="color:#888;font-size:.85em;margin-left:6px">0 = désactivé</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-topP"><i class="fa fa-percent"></i> Top-P</label>
+    <input type="number" id="node-input-topP" style="width:80px" step="0.01" min="0" max="1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">1.0 = désactivé</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-minP"><i class="fa fa-minus-circle"></i> Min-P</label>
+    <input type="number" id="node-input-minP" style="width:80px" step="0.01" min="0" max="1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">0.0 = désactivé</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-repeatPenalty"><i class="fa fa-redo"></i> Repeat penalty</label>
+    <input type="number" id="node-input-repeatPenalty" style="width:80px" step="0.05" min="1">
+  </div>
+  <div class="form-row">
+    <label for="node-input-repeatLastN"><i class="fa fa-history"></i> Repeat last N</label>
+    <input type="number" id="node-input-repeatLastN" style="width:80px" min="0">
+    <span style="color:#888;font-size:.85em;margin-left:6px">0 = désactivé</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-seed"><i class="fa fa-random"></i> Seed</label>
+    <input type="number" id="node-input-seed" style="width:120px">
+    <span style="color:#888;font-size:.85em;margin-left:6px">-1 = aléatoire</span>
+  </div>
+
+  <div class="form-row">
+    <label for="node-input-mirostat"><i class="fa fa-sliders"></i> Mirostat</label>
+    <select id="node-input-mirostat" style="width:100px">
+      <option value="0">Désactivé</option>
+      <option value="1">v1</option>
+      <option value="2">v2</option>
+    </select>
+  </div>
+  <div class="form-row">
+    <label for="node-input-mirostatTau">Mirostat τ</label>
+    <input type="number" id="node-input-mirostatTau" style="width:80px" step="0.1">
+    <span style="color:#888;font-size:.85em;margin-left:6px">entropie cible</span>
+  </div>
+  <div class="form-row">
+    <label for="node-input-mirostatEta">Mirostat η</label>
+    <input type="number" id="node-input-mirostatEta" style="width:80px" step="0.01">
+    <span style="color:#888;font-size:.85em;margin-left:6px">learning rate</span>
+  </div>
+
+  <!-- ── Chat template ─────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>Chat / Prompt</b></div>
+
+  <div class="form-row">
+    <label for="node-input-chatTemplate"><i class="fa fa-code"></i> Chat template</label>
+    <select id="node-input-chatTemplate" style="width:65%">
+      <option value="">-- depuis le modèle --</option>
+      <option value="chatml">chatml</option>
+      <option value="llama3">llama3</option>
+      <option value="llama2">llama2</option>
+      <option value="llama4">llama4</option>
+      <option value="phi3">phi3</option>
+      <option value="phi4">phi4</option>
+      <option value="gemma">gemma</option>
+      <option value="mistral-v3">mistral-v3</option>
+      <option value="mistral-v7">mistral-v7</option>
+      <option value="deepseek3">deepseek3</option>
+      <option value="command-r">command-r</option>
+      <option value="vicuna">vicuna</option>
+      <option value="zephyr">zephyr</option>
+    </select>
+  </div>
+  <div class="form-row">
+    <label for="node-input-systemPrompt"
+           style="vertical-align:top;margin-top:4px">
+      <i class="fa fa-comment"></i> System prompt
+    </label>
+    <textarea id="node-input-systemPrompt" rows="4"
+              placeholder="You are a helpful smart-home assistant..."
+              style="width:65%;font-size:.9em;"></textarea>
+  </div>
+
+  <!-- ── Debug ─────────────────────────────────────────── -->
+  <div class="form-tips" style="margin-bottom:8px;margin-top:12px"><b>Debug</b></div>
+
+  <div class="form-row">
+    <label style="width:auto">
+      <input type="checkbox" id="node-input-debugTrace" style="width:auto;margin-right:6px">
+      Activer les traces llama-server dans le debug
+    </label>
+  </div>
+  <div style="color:#888;font-size:.82em;margin-left:8px;margin-top:-4px;margin-bottom:8px">
+    Affiche les lignes <code>[llama-server:port]</code> dans le panneau Debug.<br>
+    Activable/désactivable à chaud : <code>msg.topic = "trace"</code>, <code>msg.payload = true/false</code>
+  </div>
+
+</script>
+
+<script type="text/html" data-help-name="llama-cpp">
+  <p>Lance <b>llama-server</b> (llama.cpp) comme processus enfant et expose l'inférence LLM dans un flow Node-RED. Trois modes disponibles, deux sorties.</p>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <h3>Modes</h3>
+
+  <h4>completion <small>(défaut)</small></h4>
+  <p>Utilise l'endpoint <code>/completion</code> de llama-server. Idéal pour les inférences simples sans historique de conversation.</p>
+
+  <h4>chat</h4>
+  <p>Utilise <code>/v1/chat/completions</code> (format OpenAI). Active <code>--jinja</code> automatiquement au démarrage. Permet :</p>
+  <ul>
+    <li>Conversations multi-tours via un tableau <code>messages[]</code></li>
+    <li>Accès direct par tout client MCP/OpenAI externe sur <code>http://127.0.0.1:&lt;port&gt;/v1/chat/completions</code></li>
+  </ul>
+
+  <h4>mcp-client</h4>
+  <p>Orchestre une boucle d'appels d'outils. Le nœud gère automatiquement les allers-retours entre le LLM et les outils jusqu'à obtenir une réponse texte finale.</p>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <h3>Entrées</h3>
+
+  <h4>Mode completion / chat — message standard</h4>
+  <dl class="message-properties">
+    <dt>payload <span class="property-type">string</span></dt>
+    <dd>Prompt utilisateur. Transformé en <code>### Human: … ### Assistant:</code> (completion) ou en <code>messages[{role:"user"}]</code> (chat).</dd>
+    <dt>payload <span class="property-type">array</span></dt>
+    <dd><b>Mode chat uniquement.</b> Tableau <code>[{role, content}, …]</code> — passé directement à l'API sans modification.</dd>
+    <dt>payload.messages <span class="property-type">array</span></dt>
+    <dd><b>Mode chat uniquement.</b> Objet avec clé <code>messages</code> contenant le tableau.</dd>
+  </dl>
+
+  <h4>Mode mcp-client — message initial</h4>
+  <dl class="message-properties">
+    <dt>payload <span class="property-type">string | array</span></dt>
+    <dd>Prompt ou tableau <code>messages[]</code>, identique au mode chat.</dd>
+    <dt>tools <span class="property-type">array</span></dt>
+    <dd>Définitions des outils au format OpenAI :
+<pre>[{
+  "type": "function",
+  "function": {
+    "name": "get_temperature",
+    "description": "Lire un capteur",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "sensor_id": { "type": "string" }
+      },
+      "required": ["sensor_id"]
+    }
+  }
+}]</pre>
+    </dd>
+  </dl>
+
+  <h4>Mode mcp-client — résultat d'outil</h4>
+  <p>Après avoir reçu un <code>tool_call</code> sur la sortie 2, renvoyer sur l'entrée :</p>
+  <dl class="message-properties">
+    <dt>topic <span class="property-type">string</span></dt>
+    <dd>Doit valoir <code>"tool_result"</code></dd>
+    <dt>payload.taskId <span class="property-type">string</span></dt>
+    <dd>Identifiant de la tâche reçu dans le <code>tool_call</code> — permet au nœud de reprendre la bonne conversation.</dd>
+    <dt>payload.results <span class="property-type">array</span></dt>
+    <dd>Résultats des outils :
+<pre>[{
+  "tool_call_id": "call_abc123",
+  "content": "22.5"
+}]</pre>
+    </dd>
+  </dl>
+
+  <h4>Messages de contrôle (tous modes)</h4>
+  <dl class="message-properties">
+    <dt>topic = "debug" <span class="property-type"></span></dt>
+    <dd>Émet la configuration complète (commande de spawn, arguments, sampling) sur la sortie 2, sans lancer d'inférence.</dd>
+    <dt>topic = "trace", payload = true/false <span class="property-type"></span></dt>
+    <dd>Active ou désactive à chaud l'affichage des logs <code>[llama-server:port]</code> dans le panneau Debug. Inutile de redéployer.</dd>
+  </dl>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <h3>Sorties</h3>
+
+  <h4>Sortie 1 — réponse LLM</h4>
+  <dl class="message-properties">
+    <dt>payload <span class="property-type">string</span></dt>
+    <dd>Réponse textuelle générée par le modèle (trimée).</dd>
+    <dt>messages <span class="property-type">array</span></dt>
+    <dd><b>Modes chat et mcp-client.</b> Historique complet de la conversation incluant la réponse, utilisable directement pour le tour suivant.</dd>
+  </dl>
+
+  <h4>Sortie 2 — debug / timing / tool_call</h4>
+  <dl class="message-properties">
+    <dt>topic = "timing" <span class="property-type"></span></dt>
+    <dd>Émis après chaque inférence, parsé depuis les logs de llama-server :
+<pre>{
+  "promptEvalMs": 53624,
+  "promptTokens": 209,
+  "promptTokensPerSec": 3.90,
+  "evalMs": 9399,
+  "evalTokens": 33,
+  "evalTokensPerSec": 3.51,
+  "totalMs": 63024,
+  "totalTokens": 242,
+  "port": 8082,
+  "raw": "… logs bruts …"
+}</pre>
+    </dd>
+    <dt>topic = "tool_call" <span class="property-type"></span></dt>
+    <dd><b>Mode mcp-client.</b> Le LLM demande l'exécution d'un ou plusieurs outils :
+<pre>{
+  "taskId": "1714000000000-abc",
+  "tool_calls": [{
+    "id": "call_abc123",
+    "type": "function",
+    "function": {
+      "name": "get_temperature",
+      "arguments": "{\"sensor_id\": \"salon\"}"
+    }
+  }]
+}</pre>
+    Renvoyer les résultats sur l'entrée avec <code>msg.topic = "tool_result"</code>.</dd>
+    <dt>topic = "debug" <span class="property-type"></span></dt>
+    <dd>Émis au démarrage du serveur ou sur demande (<code>msg.topic = "debug"</code>) :
+<pre>{
+  "message": "server ready",
+  "mode": "chat",
+  "command": "llama-server --model /path/model.gguf --port 8082 …",
+  "args": […],
+  "samplingDefaults": { "temperature": 0.8, … },
+  "port": 8082
+}</pre>
+    </dd>
+  </dl>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <h3>Paramètres de configuration</h3>
+
+  <h4>Modèle</h4>
+  <dl class="message-properties">
+    <dt>Chemin modèle <span class="property-type">requis</span></dt>
+    <dd>Chemin absolu vers le fichier <code>.gguf</code>.</dd>
+    <dt>Binaire</dt>
+    <dd>Nom ou chemin de l'exécutable <code>llama-server</code>. Si non présent dans <code>$PATH</code>, mettre le chemin complet, ex: <code>/opt/llama.cpp/llama-server</code>.</dd>
+    <dt>Alias</dt>
+    <dd>Nom du modèle exposé dans l'API (<code>--alias</code>). Utile quand un client MCP externe interroge le champ <code>model</code>.</dd>
+  </dl>
+
+  <h4>Serveur</h4>
+  <dl class="message-properties">
+    <dt>Port <span class="property-type">défaut: 8080</span></dt>
+    <dd>Chaque nœud doit avoir un port unique. Un nœud ne démarrera pas si le port est déjà occupé.</dd>
+    <dt>Host <span class="property-type">défaut: 127.0.0.1</span></dt>
+    <dd>Interface réseau d'écoute. Garder <code>127.0.0.1</code> sauf si accès réseau externe requis.</dd>
+    <dt>Slots parallèles (-np) <span class="property-type">défaut: 1</span></dt>
+    <dd>Nombre de requêtes simultanées. Chaque slot charge une copie du contexte en mémoire. Sur SBC, laisser à 1.</dd>
+    <dt>Continuous batching (-cb) <span class="property-type">défaut: activé</span></dt>
+    <dd>Améliore le débit quand plusieurs slots sont actifs. Sans effet avec 1 slot.</dd>
+    <dt>Flash Attention (-fa)</dt>
+    <dd>Réduit la consommation mémoire KV-cache pour les grands contextes. Désactivé si le backend GPU ne le supporte pas.</dd>
+    <dt>mlock</dt>
+    <dd>Verrouille le modèle en RAM — empêche le swap. Nécessite des droits suffisants (<code>ulimit -l unlimited</code>).</dd>
+    <dt>Désactiver mmap</dt>
+    <dd>Charge le modèle entièrement en RAM au lieu d'utiliser mmap. Plus rapide en inférence, mais le démarrage est plus lent.</dd>
+    <dt>Pas de warmup</dt>
+    <dd>Saute la passe d'échauffement au démarrage (<code>--no-warmup</code>). Démarre plus vite, première inférence potentiellement plus lente.</dd>
+  </dl>
+
+  <h4>Contexte</h4>
+  <dl class="message-properties">
+    <dt>Context (-c) <span class="property-type">défaut: 2048</span></dt>
+    <dd>Taille de la fenêtre de contexte en tokens. Valeur 0 = utiliser la valeur du modèle GGUF. Plus le contexte est grand, plus la RAM nécessaire est importante.</dd>
+    <dt>Batch size (-b) <span class="property-type">défaut: 512</span></dt>
+    <dd>Nombre de tokens traités en parallèle lors du prefill (traitement du prompt). Augmenter améliore la vitesse de prefill au prix de RAM.</dd>
+    <dt>μBatch size (-ub) <span class="property-type">défaut: 512</span></dt>
+    <dd>Taille du micro-batch physique. Doit être ≤ batch size. Sur SBC, réduire à 128-256 peut améliorer la stabilité.</dd>
+    <dt>Désactiver context shift</dt>
+    <dd>Par défaut, quand le contexte est plein, les tokens les plus anciens sont supprimés. Cette option désactive ce comportement — la génération s'arrête quand le contexte est plein.</dd>
+  </dl>
+
+  <h4>CPU / Threads</h4>
+  <dl class="message-properties">
+    <dt>Threads inférence <span class="property-type">défaut: -1 (auto)</span></dt>
+    <dd>Nombre de threads CPU pour la génération token par token. <code>-1</code> = détection automatique. Sur Radxa Dragon Q6A (8 cœurs), essayer 4 à 6.</dd>
+    <dt>Threads batch <span class="property-type">défaut: -1 (auto)</span></dt>
+    <dd>Threads CPU pour le traitement du prompt (prefill). Peut être différent des threads d'inférence. <code>-1</code> = identique aux threads d'inférence.</dd>
+  </dl>
+
+  <h4>GPU</h4>
+  <dl class="message-properties">
+    <dt>GPU layers (-ngl) <span class="property-type">défaut: 0</span></dt>
+    <dd>Nombre de couches du modèle déchargées sur GPU. <code>0</code> = CPU uniquement. <code>-1</code> = tout sur GPU. Nécessite un build llama.cpp avec support GPU (CUDA, Vulkan, Metal). Non envoyé si 0.</dd>
+    <dt>Split mode</dt>
+    <dd>Stratégie de répartition sur plusieurs GPU : <code>none</code>, <code>layer</code> (par couche) ou <code>row</code> (par ligne de tenseur). Ignoré si 1 seul GPU.</dd>
+    <dt>GPU principal</dt>
+    <dd>Index du GPU principal pour le calcul (<code>--main-gpu</code>). Non envoyé si vide ou 0.</dd>
+    <dt>Tensor split</dt>
+    <dd>Proportions de mémoire GPU allouées par GPU, ex: <code>3,1</code> pour 75%/25%. Multi-GPU uniquement.</dd>
+  </dl>
+
+  <h4>Sampling (défauts par requête)</h4>
+  <dl class="message-properties">
+    <dt>Max tokens <span class="property-type">défaut: 512</span></dt>
+    <dd>Nombre maximum de tokens générés par réponse (<code>n_predict</code>).</dd>
+    <dt>Temperature <span class="property-type">défaut: 0.8</span></dt>
+    <dd>Créativité de la génération. <code>0</code> = déterministe (toujours le token le plus probable). <code>1</code>+ = plus aléatoire.</dd>
+    <dt>Top-K <span class="property-type">défaut: 40</span></dt>
+    <dd>Limite la sélection aux K tokens les plus probables. <code>0</code> = désactivé.</dd>
+    <dt>Top-P <span class="property-type">défaut: 0.95</span></dt>
+    <dd>Nucleus sampling : sélectionne parmi les tokens couvrant P% de la probabilité cumulée. <code>1.0</code> = désactivé.</dd>
+    <dt>Min-P <span class="property-type">défaut: 0.05</span></dt>
+    <dd>Filtre les tokens dont la probabilité est inférieure à P × (prob. du token le plus probable). <code>0</code> = désactivé.</dd>
+    <dt>Repeat penalty <span class="property-type">défaut: 1.1</span></dt>
+    <dd>Pénalise la répétition des tokens déjà générés. <code>1.0</code> = aucune pénalité.</dd>
+    <dt>Repeat last N <span class="property-type">défaut: 64</span></dt>
+    <dd>Fenêtre de tokens considérés pour la pénalité de répétition. <code>0</code> = désactivé.</dd>
+    <dt>Seed <span class="property-type">défaut: -1</span></dt>
+    <dd>Graine aléatoire pour la reproductibilité. <code>-1</code> = aléatoire. Non envoyé si -1.</dd>
+    <dt>Mirostat <span class="property-type">défaut: désactivé</span></dt>
+    <dd>Algorithme de sampling adaptatif maintenant une perplexité cible. <code>v1</code> ou <code>v2</code>. Remplace Top-K/Top-P quand activé.</dd>
+    <dt>Mirostat τ (tau) <span class="property-type">défaut: 5.0</span></dt>
+    <dd>Entropie cible de Mirostat. Valeurs plus élevées = sorties plus diversifiées.</dd>
+    <dt>Mirostat η (eta) <span class="property-type">défaut: 0.1</span></dt>
+    <dd>Vitesse d'apprentissage de Mirostat. Contrôle la rapidité d'adaptation au texte généré.</dd>
+  </dl>
+
+  <h4>Chat / Prompt</h4>
+  <dl class="message-properties">
+    <dt>Chat template</dt>
+    <dd>Format de conversation du modèle. Laisser vide pour lire depuis les métadonnées GGUF (recommandé). Forcer manuellement uniquement si le modèle ne contient pas de template ou si le template auto est incorrect. Templates disponibles : <code>chatml</code>, <code>llama3</code>, <code>llama2</code>, <code>llama4</code>, <code>phi3</code>, <code>phi4</code>, <code>gemma</code>, <code>mistral-v3</code>, <code>mistral-v7</code>, <code>deepseek3</code>, <code>command-r</code>, <code>vicuna</code>, <code>zephyr</code>…</dd>
+    <dt>System prompt</dt>
+    <dd>Instructions système injectées au début de chaque conversation. En mode <code>completion</code>, préfixe le prompt avec <code>### System:</code>. En modes <code>chat</code> et <code>mcp-client</code>, inséré comme message <code>{role: "system"}</code>. Ignoré si <code>msg.payload</code> est déjà un tableau <code>messages[]</code>.</dd>
+  </dl>
+
+  <h4>Debug</h4>
+  <dl class="message-properties">
+    <dt>Activer les traces</dt>
+    <dd>Envoie chaque ligne de stdout/stderr de llama-server dans le panneau Debug Node-RED sous la forme <code>[llama-server:port] …</code>. Utile pour diagnostiquer les problèmes de démarrage ou analyser le comportement interne (cache, slots, sampler chain). Désactiver en production — génère beaucoup de messages. Aussi contrôlable à chaud via <code>msg.topic = "trace"</code>.</dd>
+  </dl>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <h3>Comportements automatiques</h3>
+  <ul>
+    <li><b>Démarrage au deploy</b> — le serveur démarre immédiatement sans attendre un premier message.</li>
+    <li><b>File d'attente</b> — les messages reçus pendant le chargement du modèle sont mis en file et traités dans l'ordre dès que le serveur est prêt.</li>
+    <li><b>Détection de port occupé</b> — si le port est déjà utilisé, le nœud affiche une erreur claire et ne démarre pas.</li>
+    <li><b>Arrêt propre</b> — au redéploiement, SIGTERM est envoyé au processus, suivi de SIGKILL après 3 secondes si nécessaire.</li>
+    <li><b>Timing automatique</b> — les métriques de performance sont parsées depuis les logs et émises sur la sortie 2 après chaque inférence, même sans traces activées.</li>
+  </ul>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <h3>Exemple flow mcp-client</h3>
+  <pre>
+[inject prompt + tools]
+  → [llama-cpp (mcp-client)]
+       sortie 1 → [traiter réponse finale]
+       sortie 2 → [switch topic]
+                    "tool_call" → [exécuter outil]
+                                  → [construire tool_result]
+                                  → [entrée llama-cpp]
+                    "timing"    → [dashboard perf]
+                    "debug"     → [log]
+  </pre>
+</script>

@@ -1,0 +1,39 @@
+{
+  "name": "node-red-contrib-llama-cpp",
+  "version": "1.0.0",
+  "description": "Node-RED node for on-device LLM inference via llama-server (llama.cpp)",
+  "keywords": [
+    "node-red",
+    "llama",
+    "llama.cpp",
+    "llm",
+    "ai",
+    "inference",
+    "local-llm",
+    "gguf",
+    "mcp",
+    "openai-compatible",
+    "edge-ai",
+    "embedded"
+  ],
+  "author": "",
+  "license": "MIT",
+  "node-red": {
+    "version": ">=3.0.0",
+    "nodes": {
+      "llama-cpp": "llama-cpp.js"
+    }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/node-red-contrib-llama-cpp"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_USERNAME/node-red-contrib-llama-cpp/issues"
+  },
+  "homepage": "https://github.com/YOUR_USERNAME/node-red-contrib-llama-cpp#readme",
+  "dependencies": {}
+}
