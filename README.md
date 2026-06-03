@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/26741266/README.md)
 # node-red-contrib-llama-cpp
 
 [![npm version](https://img.shields.io/npm/v/node-red-contrib-llama-cpp.svg)](https://www.npmjs.com/package/node-red-contrib-llama-cpp)
@@ -14,6 +13,7 @@ Designed for edge devices and SBCs (Raspberry Pi, Radxa, Orange Pi…), but work
 ## Features
 
 - 🔁 **Three inference modes** — raw completion, OpenAI-compatible chat, MCP tool-call orchestration
+- 🤖 **Agent loop control** — automatic or manual tool-call orchestration (`autoToolLoop`)
 - ⚡ **Automatic lifecycle** — spawns `llama-server` on deploy, queues messages during model load, kills cleanly on redeploy
 - 🔌 **Multi-model** — each node instance manages its own server on its own port
 - 📊 **Performance metrics** — timing stats (tokens/sec, eval time…) parsed from logs and emitted on output 2
@@ -125,9 +125,9 @@ Pass `msg.messages` back as `msg.payload` on the next turn to continue the conve
 
 ### `mcp-client`
 
-Orchestrates a full tool-call loop. The node handles the back-and-forth between the LLM and your tools automatically until a final text response is produced.
+Orchestrates a tool-call loop between the LLM and your Node-RED flow. The behaviour depends on the **Tool loop** setting.
 
-**Input:**
+**Input — initial message:**
 ```javascript
 msg.payload = "What is the temperature in the salon?"
 msg.tools = [{
@@ -146,11 +146,17 @@ msg.tools = [{
 }]
 ```
 
+---
+
+#### Tool loop: Automatic (`autoToolLoop: true`, default)
+
+The node stores the conversation state and manages the entire loop. When the LLM requests a tool, the node emits on output 2, waits for a `tool_result` message back on its input, re-submits to the LLM, and repeats until a final text response is produced.
+
 **Output 2 — tool call request:**
 ```javascript
 msg.topic   = "tool_call"
 msg.payload = {
-  taskId:     "1714000000000-abc",
+  taskId:     "1714000000000-abc",   // keep this to send results back
   tool_calls: [{
     id:   "call_xyz",
     type: "function",
@@ -166,7 +172,7 @@ msg.payload = {
 ```javascript
 msg.topic   = "tool_result"
 msg.payload = {
-  taskId:  "1714000000000-abc",   // same taskId received
+  taskId:  "1714000000000-abc",   // same taskId received above
   results: [{
     tool_call_id: "call_xyz",
     content:      "22.5"
@@ -174,19 +180,78 @@ msg.payload = {
 }
 ```
 
-The node re-runs the LLM with the tool result and repeats until the model returns a text response on **output 1**.
+**Output 1 — final response (after all tool calls resolved):**
+```javascript
+msg.payload  = "The salon temperature is 22.5°C."
+msg.messages = [ /* full conversation history */ ]
+```
 
 **Example flow:**
 ```
 [inject: prompt + tools]
-  → [llama-cpp (mcp-client)]
-       output 1 → [handle final response]
+  → [llama-cpp (mcp-client, auto loop)]
+       output 1 → [final response]
        output 2 → [switch on msg.topic]
                     "tool_call" → [execute tool]
-                                    → [build tool_result msg]
-                                    → [llama-cpp input]
+                                    → [build tool_result]
+                                    → [llama-cpp input]   ← loop back
                     "timing"    → [dashboard]
                     "debug"     → [debug node]
+```
+
+---
+
+#### Tool loop: Manual (`autoToolLoop: false`)
+
+The node emits the tool call on output 2 and **stops immediately** — it does not store state or wait for a result. The flow is fully responsible for executing tools, appending results to the conversation history, and re-submitting to the node for the next LLM turn.
+
+Use this when you need full control between turns: logging, conditional routing by tool name, calling different execution nodes, or building complex agentic pipelines.
+
+**Output 2 — tool call request (includes full context for the flow):**
+```javascript
+msg.topic   = "tool_call"
+msg.payload = {
+  taskId:     "1714000000000-abc",   // for traceability only
+  tool_calls: [{
+    id:   "call_xyz",
+    type: "function",
+    function: {
+      name:      "get_sensor",
+      arguments: "{\"sensor_id\": \"salon\"}"
+    }
+  }],
+  messages: [ /* full conversation history up to this point */ ],
+  tools:    [ /* original tools array — pass back on next turn */ ]
+}
+```
+
+**To continue — send back to node input after executing tools:**
+```javascript
+// Append tool results to messages, then:
+msg.payload = [
+  ...previousMessages,                    // from payload.messages above
+  {
+    role:         "tool",
+    tool_call_id: "call_xyz",
+    content:      "22.5"
+  }
+]
+msg.tools = previousTools                 // from payload.tools above
+// → node will call the LLM again with the updated history
+```
+
+**Example flow:**
+```
+[inject: prompt + tools]
+  → [llama-cpp (mcp-client, manual loop)]
+       output 1 → [final response]
+       output 2 → [switch on msg.topic]
+                    "tool_call" → [switch on tool name]
+                                    "get_sensor"  → [read sensor node]
+                                    "set_light"   → [MQTT out node]
+                                  → [append tool result to messages]
+                                  → [llama-cpp input]   ← manual loop back
+                    "timing"    → [dashboard]
 ```
 
 ---
@@ -239,15 +304,22 @@ Send `msg.topic = "debug"` to the node input at any time to trigger this without
 
 These topics are handled by the node without triggering inference:
 
-| `msg.topic`   | `msg.payload`       | Effect                                                    |
-|---------------|---------------------|-----------------------------------------------------------|
-| `"debug"`     | *(ignored)*         | Emits full config on output 2                             |
-| `"trace"`     | `true` / `false`    | Enables/disables llama-server log forwarding to Node-RED debug panel |
-| `"tool_result"` | `{ taskId, results[] }` | Feeds tool results back into an active mcp-client loop |
+| `msg.topic`     | `msg.payload`           | Effect                                                             |
+|-----------------|-------------------------|--------------------------------------------------------------------|
+| `"debug"`       | *(ignored)*             | Emits full config on output 2                                      |
+| `"trace"`       | `true` / `false`        | Enables/disables llama-server log forwarding to Node-RED debug panel |
+| `"tool_result"` | `{ taskId, results[] }` | **Auto loop only.** Feeds tool results back into an active mcp-client loop |
 
 ---
 
 ## Configuration Reference
+
+### Mode & Agent
+
+| Field         | Default        | Description |
+|---------------|----------------|-------------|
+| Mode          | `completion`   | `completion` = raw `/completion` endpoint. `chat` = OpenAI-compatible `/v1/chat/completions`. `mcp-client` = tool-call orchestration. |
+| Tool loop     | `Automatic`    | `mcp-client` only. **Automatic**: node manages the full loop, waits for `tool_result` messages. **Manual**: node emits `tool_call` and stops — the flow handles execution and re-submission. |
 
 ### Model
 

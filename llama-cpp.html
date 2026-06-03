@@ -5,6 +5,7 @@
     defaults: {
       name:          { value: "" },
       mode:          { value: "completion" },
+      autoToolLoop:  { value: true },
       // Model
       modelPath:     { value: "", required: true },
       llamaBinary:   { value: "llama-server" },
@@ -52,7 +53,32 @@
     outputs: 2,
     icon: "font-awesome/fa-microchip",
     label: function () { return this.name || "llama.cpp"; },
-    paletteLabel: "llama.cpp"
+    paletteLabel: "llama.cpp",
+    oneditprepare: function () {
+      function updateAutoToolLoopVisibility() {
+        const mode = $("#node-input-mode").val();
+        const val  = $("#node-input-autoToolLoop").val();
+        if (mode === "mcp-client") {
+          $("#row-autoToolLoop").show();
+          $("#hint-autoToolLoop-auto").toggle(val === "true");
+          $("#hint-autoToolLoop-manual").toggle(val === "false");
+        } else {
+          $("#row-autoToolLoop").hide();
+          $("#hint-autoToolLoop-auto").hide();
+          $("#hint-autoToolLoop-manual").hide();
+        }
+      }
+      // Initialiser avec la valeur stockée (bool → string pour le select)
+      const stored = this.autoToolLoop !== false ? "true" : "false";
+      $("#node-input-autoToolLoop").val(stored);
+      $("#node-input-mode").on("change", updateAutoToolLoopVisibility);
+      $("#node-input-autoToolLoop").on("change", updateAutoToolLoopVisibility);
+      updateAutoToolLoopVisibility();
+    },
+    oneditsave: function () {
+      // Reconvertir string → bool avant sauvegarde
+      this.autoToolLoop = $("#node-input-autoToolLoop").val() !== "false";
+    }
   });
 </script>
 
@@ -67,9 +93,24 @@
     <label for="node-input-mode"><i class="fa fa-exchange"></i> Mode</label>
     <select id="node-input-mode" style="width:65%">
       <option value="completion">completion — /completion (simple, défaut)</option>
-      <option value="chat">chat — /v1/chat/completions (format OpenAI + serveur MCP)</option>
+      <option value="openai">openai — proxy pur /v1/chat/completions (JSON OpenAI)</option>
+      <option value="chat">chat — /v1/chat/completions (multi-tour, historique auto)</option>
       <option value="mcp-client">mcp-client — orchestration d'appels d'outils</option>
     </select>
+  </div>
+
+  <div class="form-row" id="row-autoToolLoop">
+    <label for="node-input-autoToolLoop"><i class="fa fa-refresh"></i> Boucle outils</label>
+    <select id="node-input-autoToolLoop" style="width:65%">
+      <option value="true">Automatique — le nœud gère toute la boucle</option>
+      <option value="false">Manuelle — le flow reprend la main après chaque outil</option>
+    </select>
+  </div>
+  <div id="hint-autoToolLoop-auto"   style="display:none;color:#888;font-size:.82em;margin:-6px 0 8px 110px">
+    Le nœud stocke l'état de la conversation et relance automatiquement l'inférence après chaque résultat d'outil, jusqu'à la réponse finale.
+  </div>
+  <div id="hint-autoToolLoop-manual" style="display:none;color:#888;font-size:.82em;margin:-6px 0 8px 110px">
+    Après chaque <code>tool_call</code>, le nœud s'arrête. La sortie 2 contient <code>messages[]</code> et <code>tools[]</code> pour que le flow reconstruise le tour suivant et renvoie sur l'entrée.
   </div>
 
   <!-- ── Model ─────────────────────────────────────────── -->

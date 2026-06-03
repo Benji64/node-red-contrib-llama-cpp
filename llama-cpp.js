@@ -14,7 +14,10 @@ module.exports = function (RED) {
 
     // ── Mode ───────────────────────────────────────────────
     // "completion" | "chat" | "mcp-client"
-    node.mode = config.mode || "completion";
+    node.mode         = config.mode         || "completion";
+    // autoToolLoop : true  = le nœud gère la boucle outil automatiquement
+    //                false = le nœud émet tool_call et s'arrête, le flow prend la main
+    node.autoToolLoop = config.autoToolLoop !== false; // défaut : true
 
     // ── Server ─────────────────────────────────────────────
     node.serverPort   = parseInt(config.serverPort)  || 8080;
@@ -120,7 +123,7 @@ module.exports = function (RED) {
       if (node.ngl > 0)        a.push("-ngl", String(node.ngl));
       if (node.seed !== -1)    a.push("--seed", String(node.seed));
       if (node.alias)          a.push("--alias", node.alias);
-      // --jinja requis pour chat et mcp-client
+      // --jinja requis pour chat, mcp-client et openai
       if (node.mode !== "completion") a.push("--jinja");
       if (node.chatTemplate)   a.push("--chat-template", node.chatTemplate);
       if (node.flashAttn)      a.push("-fa");
@@ -182,26 +185,58 @@ module.exports = function (RED) {
     }
 
     // ──────────────────────────────────────────────────────
-    // Mode 1 : /completion
+    // Mode 1 : /completion — proxy pur, une requête → une réponse, pas de boucle
     // ──────────────────────────────────────────────────────
 
     function handleCompletion(msg) {
-      const userPrompt = typeof msg.payload === "string"
-        ? msg.payload : JSON.stringify(msg.payload);
-      const fullPrompt = node.systemPrompt
-        ? `### System:\n${node.systemPrompt}\n\n### Human:\n${userPrompt}\n\n### Assistant:\n`
-        : `### Human:\n${userPrompt}\n\n### Assistant:\n`;
+      let p = msg.payload;
+
+      // Auto-parse si le payload est une string JSON
+      if (typeof p === "string") {
+        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
+      }
+
+      let prompt;
+
+      // Objet OpenAI { messages: [...] } → construire le prompt depuis l'historique
+      if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
+        prompt = p.messages.map((m) => {
+          if (m.role === "system")    return `### System:\n${m.content}`;
+          if (m.role === "user")      return `### Human:\n${m.content}`;
+          if (m.role === "assistant") return `### Assistant:\n${m.content}`;
+          return m.content;
+        }).join("\n\n") + "\n\n### Assistant:\n";
+
+      // Tableau messages[] direct
+      } else if (Array.isArray(p)) {
+        prompt = p.map((m) => {
+          if (m.role === "system")    return `### System:\n${m.content}`;
+          if (m.role === "user")      return `### Human:\n${m.content}`;
+          if (m.role === "assistant") return `### Assistant:\n${m.content}`;
+          return m.content;
+        }).join("\n\n") + "\n\n### Assistant:\n";
+
+      // String simple
+      } else {
+        const text = typeof p === "string" ? p : JSON.stringify(p);
+        prompt = node.systemPrompt
+          ? `### System:\n${node.systemPrompt}\n\n### Human:\n${text}\n\n### Assistant:\n`
+          : `### Human:\n${text}\n\n### Assistant:\n`;
+      }
+
+      // Sampling : les valeurs du payload ont priorité sur les défauts du nœud
+      const sp = (p && typeof p === "object" && !Array.isArray(p)) ? p : {};
 
       setStatus("blue", "inferring...");
       httpPost("/completion", {
-        prompt: fullPrompt,
-        n_predict:      node.maxTokens,
-        temperature:    node.temperature,
-        top_k:          node.topK,
-        top_p:          node.topP,
-        min_p:          node.minP,
-        repeat_penalty: node.repeatPenalty,
-        repeat_last_n:  node.repeatLastN,
+        prompt,
+        n_predict:      sp.max_tokens     || sp.n_predict     || node.maxTokens,
+        temperature:    sp.temperature    !== undefined        ? sp.temperature    : node.temperature,
+        top_k:          sp.top_k          !== undefined        ? sp.top_k          : node.topK,
+        top_p:          sp.top_p          !== undefined        ? sp.top_p          : node.topP,
+        min_p:          sp.min_p          !== undefined        ? sp.min_p          : node.minP,
+        repeat_penalty: sp.repeat_penalty !== undefined        ? sp.repeat_penalty : node.repeatPenalty,
+        repeat_last_n:  sp.repeat_last_n  !== undefined        ? sp.repeat_last_n  : node.repeatLastN,
         mirostat:       node.mirostat,
         mirostat_tau:   node.mirostatTau,
         mirostat_eta:   node.mirostatEta,
@@ -209,6 +244,7 @@ module.exports = function (RED) {
         stop:           ["\n### Human:", "\n### User:"]
       }, (err, parsed) => {
         if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
+        // Réponse unique — on retourne le texte et c'est tout
         msg.payload = (parsed.content || "").trim();
         node.send([msg, null]);
         setStatus("green", `ready :${node.serverPort}`);
@@ -219,34 +255,64 @@ module.exports = function (RED) {
     // Mode 2 : /v1/chat/completions (chat simple)
     // ──────────────────────────────────────────────────────
 
-    function handleChat(msg) {
-      // msg.payload peut être : string | { role, content }[] | { messages: [] }
+    // Construit le body final pour /v1/chat/completions.
+    // Si msg.payload est déjà un objet OpenAI complet (avec messages[]),
+    // on le passe tel quel en complétant seulement les champs absents
+    // avec les valeurs du nœud. Les champs du payload ont priorité.
+    function buildChatBody(msg) {
+      let p = msg.payload;
+
+      // Auto-parse si le payload est une string JSON
+      if (typeof p === "string") {
+        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
+      }
+
+      // Cas 1 — payload est un objet OpenAI complet ou partiel : { messages, model?, temperature?, … }
+      if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
+        return Object.assign({
+          model:          node.alias || "local",
+          stream:         false,
+          ...samplingParams()
+        }, p); // les champs du payload écrasent les défauts du nœud
+      }
+
+      // Cas 2 — payload est un tableau messages[]
       let messages;
-      if (typeof msg.payload === "string") {
+      if (Array.isArray(p)) {
+        messages = p;
+      } else if (typeof p === "string") {
         messages = [];
         if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
-        messages.push({ role: "user", content: msg.payload });
-      } else if (Array.isArray(msg.payload)) {
-        messages = msg.payload;
-      } else if (msg.payload && Array.isArray(msg.payload.messages)) {
-        messages = msg.payload.messages;
+        messages.push({ role: "user", content: p });
       } else {
-        node.error("Mode chat: msg.payload doit être une string ou un tableau messages[]", msg);
+        return null; // erreur gérée par l'appelant
+      }
+
+      return {
+        model:    node.alias || "local",
+        messages,
+        stream:   false,
+        ...samplingParams()
+      };
+    }
+
+    function handleChat(msg) {
+      const body = buildChatBody(msg);
+      if (!body) {
+        node.error("Mode chat: msg.payload doit être une string, un tableau messages[], ou un objet { messages: [] }", msg);
         return;
       }
 
       setStatus("blue", "inferring...");
-      httpPost("/v1/chat/completions", {
-        model:    node.alias || "local",
-        messages,
-        ...samplingParams(),
-        stream: false
-      }, (err, parsed) => {
+      httpPost("/v1/chat/completions", body, (err, parsed) => {
         if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
         const choice = parsed.choices && parsed.choices[0];
         if (!choice) { node.error("Réponse vide du serveur", msg); return; }
-        msg.payload = choice.message.content || "";
-        msg.messages = messages.concat([choice.message]);
+
+        // Retourner le message complet (content + tool_calls éventuels)
+        // Le flow externe (redclaw) gère la suite — le nœud ne boucle JAMAIS
+        msg.payload  = choice.message;
+        msg.messages = body.messages.concat([choice.message]);
         node.send([msg, null]);
         setStatus("green", `ready :${node.serverPort}`);
       });
@@ -257,20 +323,37 @@ module.exports = function (RED) {
     // ──────────────────────────────────────────────────────
 
     function handleMcpClient(msg) {
-      // Construction des messages initiaux
-      let messages;
-      if (typeof msg.payload === "string") {
+      let p = msg.payload;
+
+      // Auto-parse si le payload est une string JSON
+      if (typeof p === "string") {
+        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
+      }
+
+      let messages, tools;
+
+      // Cas 1 — objet OpenAI complet : { messages[], tools?, model?, … }
+      if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
+        messages = p.messages;
+        tools    = p.tools || msg.tools || [];
+      }
+      // Cas 2 — tableau messages[]
+      else if (Array.isArray(p)) {
+        messages = p;
+        tools    = msg.tools || [];
+      }
+      // Cas 3 — string
+      else if (typeof p === "string") {
         messages = [];
         if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
-        messages.push({ role: "user", content: msg.payload });
-      } else if (Array.isArray(msg.payload)) {
-        messages = msg.payload;
-      } else {
-        node.error("Mode mcp-client: msg.payload doit être une string ou un tableau messages[]", msg);
+        messages.push({ role: "user", content: p });
+        tools = msg.tools || [];
+      }
+      else {
+        node.error("Mode mcp-client: msg.payload doit être une string, un tableau messages[], ou un objet { messages: [] }", msg);
         return;
       }
 
-      const tools = msg.tools || [];
       runMcpLoop(msg, messages, tools);
     }
 
@@ -297,29 +380,42 @@ module.exports = function (RED) {
 
         const assistantMsg = choice.message;
 
-        // ── Appels d'outils détectés → émettre sur sortie 2 et attendre
+        // ── Appels d'outils détectés
         if (assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0) {
           const taskId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
           const updatedMessages = messages.concat([assistantMsg]);
 
-          // Stocker l'état de la conversation en attente
-          node.pendingToolCalls[taskId] = {
-            originalMsg,
-            messages: updatedMessages,
-            tools,
-            pendingCount: assistantMsg.tool_calls.length,
-            toolResults: []
-          };
+          if (node.autoToolLoop) {
+            // ── Mode automatique : stocker l'état et attendre tool_result
+            node.pendingToolCalls[taskId] = {
+              originalMsg,
+              messages: updatedMessages,
+              tools,
+              pendingCount: assistantMsg.tool_calls.length,
+              toolResults:  []
+            };
+            node.send([null, {
+              topic:   "tool_call",
+              payload: { taskId, tool_calls: assistantMsg.tool_calls }
+            }]);
+            setStatus("yellow", `waiting tool results (${assistantMsg.tool_calls.length})`);
 
-          const toolCallMsg = {
-            topic:   "tool_call",
-            payload: {
-              taskId,
-              tool_calls: assistantMsg.tool_calls
-            }
-          };
-          node.send([null, toolCallMsg]);
-          setStatus("yellow", `waiting tool results (${assistantMsg.tool_calls.length})`);
+          } else {
+            // ── Mode manuel : émettre et s'arrêter — le flow reprend la main
+            // msg.messages contient l'historique complet pour que le flow
+            // puisse construire le prochain tour et renvoyer au nœud
+            originalMsg.messages = updatedMessages;
+            node.send([null, {
+              topic:   "tool_call",
+              payload: {
+                taskId,
+                tool_calls: assistantMsg.tool_calls,
+                messages:   updatedMessages,   // historique complet pour le flow
+                tools                          // outils originaux, pour les passer au tour suivant
+              }
+            }]);
+            setStatus("green", `ready :${node.serverPort}`);
+          }
           return;
         }
 
@@ -371,7 +467,66 @@ module.exports = function (RED) {
     function handleMessage(msg) {
       if      (node.mode === "chat")       handleChat(msg);
       else if (node.mode === "mcp-client") handleMcpClient(msg);
+      else if (node.mode === "openai")     handleOpenAIProxy(msg);
       else                                 handleCompletion(msg);
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Mode 4 : proxy OpenAI — pass-through pur
+    // Modèle chargé une fois au deploy, jamais rechargé.
+    // msg.payload = objet requête OpenAI complet → forwardé tel quel
+    // msg.payload = string ou messages[] → wrappé minimalement
+    // Sortie 1 : msg.payload = message complet { role, content, tool_calls? }
+    // ──────────────────────────────────────────────────────
+
+    function handleOpenAIProxy(msg) {
+      let p = msg.payload;
+
+      // Auto-parse si le payload est une string JSON
+      if (typeof p === "string") {
+        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
+      }
+
+      let body;
+
+      // Cas 1 — objet complet { messages, temperature, max_tokens, … } → passé tel quel
+      if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
+        body = Object.assign({ model: node.alias || "local", stream: false }, p);
+
+      // Cas 2 — tableau messages[]
+      } else if (Array.isArray(p)) {
+        body = { model: node.alias || "local", messages: p, stream: false, ...samplingParams() };
+
+      // Cas 3 — string simple
+      } else if (typeof p === "string") {
+        const messages = [];
+        if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
+        messages.push({ role: "user", content: p });
+        body = { model: node.alias || "local", messages, stream: false, ...samplingParams() };
+
+      } else {
+        node.error("Mode openai: msg.payload doit être un objet { messages[] }, un tableau, ou une string", msg);
+        return;
+      }
+
+      // Forcer stream: false — on ne gère pas le streaming dans Node-RED
+      body.stream = false;
+
+      setStatus("blue", "inferring...");
+      httpPost("/v1/chat/completions", body, (err, parsed) => {
+        if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
+        const choice = parsed.choices && parsed.choices[0];
+        if (!choice) { node.error("Réponse vide du serveur", msg); return; }
+
+        // msg.payload   = contenu texte de la réponse (usage direct dans le flow)
+        // msg.llamacpp  = réponse API complète (choices, usage, timings, model…)
+        // msg.messages  = historique complet pour le tour suivant
+        msg.payload   = choice.message.content || "";
+        msg.llamacpp  = parsed;
+        msg.messages  = body.messages.concat([choice.message]);
+        node.send([msg, null]);
+        setStatus("green", `ready :${node.serverPort}`);
+      });
     }
 
     // ──────────────────────────────────────────────────────
@@ -531,6 +686,7 @@ module.exports = function (RED) {
       } else { done(); }
     });
 
+    // Démarrage immédiat au deploy pour tous les modes
     startServer();
   }
 
