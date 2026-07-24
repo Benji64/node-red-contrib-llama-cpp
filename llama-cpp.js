@@ -8,32 +8,41 @@ module.exports = function (RED) {
     const node = this;
 
     // ── Model ──────────────────────────────────────────────
-    node.modelPath    = config.modelPath   || "";
-    node.llamaBinary  = config.llamaBinary || "llama-server";
-    node.alias        = config.alias       || "";
+    node.modelPath   = config.modelPath   || "";
+    node.llamaBinary = config.llamaBinary || "llama-server";
+    node.alias       = config.alias       || "";
 
-    // ── Mode ───────────────────────────────────────────────
-    // "completion" | "chat" | "mcp-client"
-    node.mode         = config.mode         || "completion";
-    // autoToolLoop : true  = le nœud gère la boucle outil automatiquement
-    //                false = le nœud émet tool_call et s'arrête, le flow prend la main
-    node.autoToolLoop = config.autoToolLoop !== false; // défaut : true
+    // ── Mode API : "completion" | "openai" | "chat" ────────
+    node.mode = config.mode || "completion";
+
+    // ── Cluster role : "standalone" | "master" | "worker" ──
+    node.clusterRole = config.clusterRole || "standalone";
+
+    // ── Worker (RPC) ────────────────────────────────────────
+    node.rpcBinary = config.rpcBinary || "rpc-server";
+    node.rpcHost   = config.rpcHost   || "0.0.0.0";
+    node.rpcPort   = parseInt(config.rpcPort) || 50052;
+    node.rpcDevice = config.rpcDevice || "";
+
+    // ── Master (RPC) ────────────────────────────────────────
+    // Texte brut, un "host:port" par ligne (ou séparés par virgules)
+    node.rpcWorkers = config.rpcWorkers || "";
 
     // ── Server ─────────────────────────────────────────────
     node.serverPort   = parseInt(config.serverPort)  || 8080;
     node.host         = config.host                  || "127.0.0.1";
     node.nSlots       = parseInt(config.nSlots)      || 1;
     node.contBatching = config.contBatching !== false;
-    node.noMmap       = config.noMmap       === true;
-    node.mlock        = config.mlock        === true;
-    node.noWarmup     = config.noWarmup     === true;
-    node.flashAttn    = config.flashAttn    === true;
+    node.noMmap       = config.noMmap     === true;
+    node.mlock        = config.mlock      === true;
+    node.noWarmup     = config.noWarmup   === true;
+    node.flashAttn    = config.flashAttn  === true;
 
     // ── Context ────────────────────────────────────────────
-    node.contextSize  = parseInt(config.contextSize) || 2048;
-    node.batchSize    = parseInt(config.batchSize)   || 512;
-    node.ubatchSize   = parseInt(config.ubatchSize)  || 512;
-    node.noCtxShift   = config.noCtxShift === true;
+    node.contextSize = parseInt(config.contextSize) || 2048;
+    node.batchSize   = parseInt(config.batchSize)   || 512;
+    node.ubatchSize  = parseInt(config.ubatchSize)  || 512;
+    node.noCtxShift  = config.noCtxShift === true;
 
     // ── Threads ────────────────────────────────────────────
     node.threads      = parseInt(config.threads)      || -1;
@@ -41,10 +50,10 @@ module.exports = function (RED) {
 
     // ── GPU ────────────────────────────────────────────────
     node.ngl         = parseInt(config.ngl) || 0;
-    node.splitMode   = config.splitMode   || "";
+    node.splitMode   = config.splitMode     || "";
     node.mainGpu     = (config.mainGpu !== "" && config.mainGpu !== undefined)
                          ? parseInt(config.mainGpu) : null;
-    node.tensorSplit = config.tensorSplit || "";
+    node.tensorSplit = config.tensorSplit   || "";
 
     // ── Sampling ───────────────────────────────────────────
     node.temperature   = parseFloat(config.temperature)   || 0.8;
@@ -67,14 +76,12 @@ module.exports = function (RED) {
     node.debugTrace = config.debugTrace === true;
 
     // ── Internal state ─────────────────────────────────────
-    node.serverProcess  = null;
-    node.serverReady    = false;
-    node.pendingQueue   = [];
-    // Mode mcp-client: conversations en attente de tool_result
-    node.pendingToolCalls = {}; // taskId → { msg, messages }
+    node.serverProcess = null;
+    node.serverReady   = false;
+    node.pendingQueue  = [];
 
     // ──────────────────────────────────────────────────────
-    // Helpers
+    // Utilitaires
     // ──────────────────────────────────────────────────────
 
     function setStatus(color, text) {
@@ -88,6 +95,7 @@ module.exports = function (RED) {
       srv.listen(port, "127.0.0.1");
     }
 
+    // Probe HTTP — utilisé pour llama-server (standalone / master)
     function waitForHttp(port, maxAttempts, cb) {
       let attempts = 0;
       function attempt() {
@@ -97,7 +105,7 @@ module.exports = function (RED) {
           () => cb(null)
         );
         req.on("error", () => {
-          if (attempts >= maxAttempts) cb(new Error(`No response after ${maxAttempts} attempts`));
+          if (attempts >= maxAttempts) cb(new Error(`Pas de réponse après ${maxAttempts} tentatives`));
           else setTimeout(attempt, 500);
         });
         req.end();
@@ -105,43 +113,24 @@ module.exports = function (RED) {
       attempt();
     }
 
-    // ──────────────────────────────────────────────────────
-    // Build spawn args
-    // ──────────────────────────────────────────────────────
-
-    function buildArgs() {
-      const a = [];
-      a.push("--model",        node.modelPath);
-      a.push("--port",         String(node.serverPort));
-      a.push("--host",         node.host);
-      a.push("--ctx-size",     String(node.contextSize));
-      a.push("--batch-size",   String(node.batchSize));
-      a.push("--ubatch-size",  String(node.ubatchSize));
-      a.push("--threads",      String(node.threads));
-      a.push("--threads-batch", String(node.threadsBatch));
-      a.push("--parallel",     String(node.nSlots));
-      if (node.ngl > 0)        a.push("-ngl", String(node.ngl));
-      if (node.seed !== -1)    a.push("--seed", String(node.seed));
-      if (node.alias)          a.push("--alias", node.alias);
-      // --jinja requis pour chat, mcp-client et openai
-      if (node.mode !== "completion") a.push("--jinja");
-      if (node.chatTemplate)   a.push("--chat-template", node.chatTemplate);
-      if (node.flashAttn)      a.push("-fa");
-      if (node.mlock)          a.push("--mlock");
-      if (node.noMmap)         a.push("--no-mmap");
-      if (node.noCtxShift)     a.push("--no-context-shift");
-      if (node.noWarmup)       a.push("--no-warmup");
-      if (!node.contBatching)  a.push("--no-cont-batching");
-      if (node.splitMode)      a.push("--split-mode", node.splitMode);
-      if (node.mainGpu !== null && node.mainGpu > 0)
-                               a.push("--main-gpu", String(node.mainGpu));
-      if (node.tensorSplit)    a.push("--tensor-split", node.tensorSplit);
-      return a;
+    // Probe TCP brut — utilisé pour rpc-server (worker), qui ne parle pas HTTP
+    function waitForTcp(host, port, maxAttempts, cb) {
+      const probeHost = (host === "0.0.0.0") ? "127.0.0.1" : host;
+      let attempts = 0;
+      function attempt() {
+        attempts++;
+        const socket = net.connect({ host: probeHost, port }, () => {
+          socket.end();
+          cb(null);
+        });
+        socket.on("error", () => {
+          socket.destroy();
+          if (attempts >= maxAttempts) cb(new Error(`Pas de réponse après ${maxAttempts} tentatives`));
+          else setTimeout(attempt, 500);
+        });
+      }
+      attempt();
     }
-
-    // ──────────────────────────────────────────────────────
-    // HTTP helpers
-    // ──────────────────────────────────────────────────────
 
     function httpPost(path, body, callback) {
       const bodyStr = JSON.stringify(body);
@@ -168,7 +157,7 @@ module.exports = function (RED) {
       req.end();
     }
 
-    function samplingParams() {
+    function samplingDefaults() {
       return {
         temperature:    node.temperature,
         max_tokens:     node.maxTokens,
@@ -177,28 +166,90 @@ module.exports = function (RED) {
         min_p:          node.minP,
         repeat_penalty: node.repeatPenalty,
         repeat_last_n:  node.repeatLastN,
-        seed:           node.seed !== -1 ? node.seed : undefined,
-        mirostat:       node.mirostat || undefined,
-        mirostat_tau:   node.mirostat ? node.mirostatTau : undefined,
-        mirostat_eta:   node.mirostat ? node.mirostatEta : undefined,
+        ...(node.seed !== -1  && { seed: node.seed }),
+        ...(node.mirostat > 0 && {
+          mirostat:     node.mirostat,
+          mirostat_tau: node.mirostatTau,
+          mirostat_eta: node.mirostatEta
+        })
       };
     }
 
+    function parsePayload(p) {
+      if (typeof p === "string") {
+        try { return JSON.parse(p); } catch (e) { /* pas du JSON */ }
+      }
+      return p;
+    }
+
+    // "192.168.1.42:50052\n192.168.1.43:50052" ou "a:1,b:2" → ["a:1","b:2"]
+    function parseRpcWorkers(raw) {
+      return String(raw || "")
+        .split(/[\n,]+/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    }
+
     // ──────────────────────────────────────────────────────
-    // Mode 1 : /completion — proxy pur, une requête → une réponse, pas de boucle
+    // Build args — llama-server (standalone & master)
+    // ──────────────────────────────────────────────────────
+
+    function buildArgs() {
+      const a = [];
+      a.push("--model",         node.modelPath);
+      a.push("--port",          String(node.serverPort));
+      a.push("--host",          node.host);
+      a.push("--ctx-size",      String(node.contextSize));
+      a.push("--batch-size",    String(node.batchSize));
+      a.push("--ubatch-size",   String(node.ubatchSize));
+      a.push("--threads",       String(node.threads));
+      a.push("--threads-batch", String(node.threadsBatch));
+      a.push("--parallel",      String(node.nSlots));
+      if (node.ngl > 0)         a.push("-ngl", String(node.ngl));
+      if (node.seed !== -1)     a.push("--seed", String(node.seed));
+      if (node.alias)           a.push("--alias", node.alias);
+      // --jinja nécessaire pour /v1/chat/completions (modes openai et chat)
+      if (node.mode !== "completion") a.push("--jinja");
+      if (node.chatTemplate)    a.push("--chat-template", node.chatTemplate);
+      if (node.flashAttn)       a.push("-fa");
+      if (node.mlock)           a.push("--mlock");
+      if (node.noMmap)          a.push("--no-mmap");
+      if (node.noCtxShift)      a.push("--no-context-shift");
+      if (node.noWarmup)        a.push("--no-warmup");
+      if (!node.contBatching)   a.push("--no-cont-batching");
+      if (node.splitMode)       a.push("--split-mode", node.splitMode);
+      if (node.mainGpu !== null && node.mainGpu > 0)
+                                a.push("--main-gpu", String(node.mainGpu));
+      if (node.tensorSplit)     a.push("--tensor-split", node.tensorSplit);
+
+      // Cluster master : ajoute les workers RPC distants
+      if (node.clusterRole === "master") {
+        const workers = parseRpcWorkers(node.rpcWorkers);
+        if (workers.length > 0) a.push("--rpc", workers.join(","));
+      }
+      return a;
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Build args — rpc-server (worker)
+    // ──────────────────────────────────────────────────────
+
+    function buildRpcArgs() {
+      const a = [];
+      a.push("--host", node.rpcHost);
+      a.push("-p",     String(node.rpcPort));
+      if (node.rpcDevice) a.push("--device", node.rpcDevice);
+      return a;
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Mode completion — /completion
     // ──────────────────────────────────────────────────────
 
     function handleCompletion(msg) {
-      let p = msg.payload;
-
-      // Auto-parse si le payload est une string JSON
-      if (typeof p === "string") {
-        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
-      }
-
+      let p = parsePayload(msg.payload);
       let prompt;
 
-      // Objet OpenAI { messages: [...] } → construire le prompt depuis l'historique
       if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
         prompt = p.messages.map((m) => {
           if (m.role === "system")    return `### System:\n${m.content}`;
@@ -206,8 +257,6 @@ module.exports = function (RED) {
           if (m.role === "assistant") return `### Assistant:\n${m.content}`;
           return m.content;
         }).join("\n\n") + "\n\n### Assistant:\n";
-
-      // Tableau messages[] direct
       } else if (Array.isArray(p)) {
         prompt = p.map((m) => {
           if (m.role === "system")    return `### System:\n${m.content}`;
@@ -215,8 +264,6 @@ module.exports = function (RED) {
           if (m.role === "assistant") return `### Assistant:\n${m.content}`;
           return m.content;
         }).join("\n\n") + "\n\n### Assistant:\n";
-
-      // String simple
       } else {
         const text = typeof p === "string" ? p : JSON.stringify(p);
         prompt = node.systemPrompt
@@ -224,19 +271,18 @@ module.exports = function (RED) {
           : `### Human:\n${text}\n\n### Assistant:\n`;
       }
 
-      // Sampling : les valeurs du payload ont priorité sur les défauts du nœud
       const sp = (p && typeof p === "object" && !Array.isArray(p)) ? p : {};
-
       setStatus("blue", "inferring...");
+
       httpPost("/completion", {
         prompt,
         n_predict:      sp.max_tokens     || sp.n_predict     || node.maxTokens,
-        temperature:    sp.temperature    !== undefined        ? sp.temperature    : node.temperature,
-        top_k:          sp.top_k          !== undefined        ? sp.top_k          : node.topK,
-        top_p:          sp.top_p          !== undefined        ? sp.top_p          : node.topP,
-        min_p:          sp.min_p          !== undefined        ? sp.min_p          : node.minP,
-        repeat_penalty: sp.repeat_penalty !== undefined        ? sp.repeat_penalty : node.repeatPenalty,
-        repeat_last_n:  sp.repeat_last_n  !== undefined        ? sp.repeat_last_n  : node.repeatLastN,
+        temperature:    sp.temperature    !== undefined ? sp.temperature    : node.temperature,
+        top_k:          sp.top_k          !== undefined ? sp.top_k          : node.topK,
+        top_p:          sp.top_p          !== undefined ? sp.top_p          : node.topP,
+        min_p:          sp.min_p          !== undefined ? sp.min_p          : node.minP,
+        repeat_penalty: sp.repeat_penalty !== undefined ? sp.repeat_penalty : node.repeatPenalty,
+        repeat_last_n:  sp.repeat_last_n  !== undefined ? sp.repeat_last_n  : node.repeatLastN,
         mirostat:       node.mirostat,
         mirostat_tau:   node.mirostatTau,
         mirostat_eta:   node.mirostatEta,
@@ -244,343 +290,153 @@ module.exports = function (RED) {
         stop:           ["\n### Human:", "\n### User:"]
       }, (err, parsed) => {
         if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
-        // Réponse unique — on retourne le texte et c'est tout
-        msg.payload = (parsed.content || "").trim();
+        msg.payload  = (parsed.content || "").trim();
+        msg.llamacpp = parsed;
         node.send([msg, null]);
-        setStatus("green", `ready :${node.serverPort}`);
+        setStatus("green", statusReadyText());
       });
     }
 
     // ──────────────────────────────────────────────────────
-    // Mode 2 : /v1/chat/completions (chat simple)
+    // Mode openai — proxy pur /v1/chat/completions
     // ──────────────────────────────────────────────────────
 
-    // Construit le body final pour /v1/chat/completions.
-    // Si msg.payload est déjà un objet OpenAI complet (avec messages[]),
-    // on le passe tel quel en complétant seulement les champs absents
-    // avec les valeurs du nœud. Les champs du payload ont priorité.
-    function buildChatBody(msg) {
-      let p = msg.payload;
+    function handleOpenAI(msg) {
+      let p = parsePayload(msg.payload);
+      let body;
 
-      // Auto-parse si le payload est une string JSON
-      if (typeof p === "string") {
-        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
-      }
-
-      // Cas 1 — payload est un objet OpenAI complet ou partiel : { messages, model?, temperature?, … }
       if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
-        return Object.assign({
-          model:          node.alias || "local",
-          stream:         false,
-          ...samplingParams()
-        }, p); // les champs du payload écrasent les défauts du nœud
-      }
-
-      // Cas 2 — payload est un tableau messages[]
-      let messages;
-      if (Array.isArray(p)) {
-        messages = p;
-      } else if (typeof p === "string") {
-        messages = [];
-        if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
-        messages.push({ role: "user", content: p });
+        body = Object.assign({ model: node.alias || "local", stream: false }, p);
+      } else if (Array.isArray(p)) {
+        body = { model: node.alias || "local", messages: p, stream: false, ...samplingDefaults() };
       } else {
-        return null; // erreur gérée par l'appelant
+        const text = typeof p === "string" ? p : JSON.stringify(p);
+        const messages = [];
+        if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
+        messages.push({ role: "user", content: text });
+        body = { model: node.alias || "local", messages, stream: false, ...samplingDefaults() };
       }
 
-      return {
-        model:    node.alias || "local",
-        messages,
-        stream:   false,
-        ...samplingParams()
-      };
-    }
-
-    function handleChat(msg) {
-      const body = buildChatBody(msg);
-      if (!body) {
-        node.error("Mode chat: msg.payload doit être une string, un tableau messages[], ou un objet { messages: [] }", msg);
-        return;
-      }
-
+      body.stream = false;
       setStatus("blue", "inferring...");
+
       httpPost("/v1/chat/completions", body, (err, parsed) => {
         if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
         const choice = parsed.choices && parsed.choices[0];
         if (!choice) { node.error("Réponse vide du serveur", msg); return; }
 
-        // Retourner le message complet (content + tool_calls éventuels)
-        // Le flow externe (redclaw) gère la suite — le nœud ne boucle JAMAIS
-        msg.payload  = choice.message;
+        msg.payload  = choice.message.content || "";
+        msg.llamacpp = parsed;
         msg.messages = body.messages.concat([choice.message]);
         node.send([msg, null]);
-        setStatus("green", `ready :${node.serverPort}`);
+        setStatus("green", statusReadyText());
       });
     }
 
     // ──────────────────────────────────────────────────────
-    // Mode 3 : client MCP — boucle d'appels d'outils
+    // Mode chat — /v1/chat/completions + historique multi-tour
     // ──────────────────────────────────────────────────────
 
-    function handleMcpClient(msg) {
-      let p = msg.payload;
+    function handleChat(msg) {
+      let p = parsePayload(msg.payload);
+      let body;
 
-      // Auto-parse si le payload est une string JSON
-      if (typeof p === "string") {
-        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
-      }
-
-      let messages, tools;
-
-      // Cas 1 — objet OpenAI complet : { messages[], tools?, model?, … }
       if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
-        messages = p.messages;
-        tools    = p.tools || msg.tools || [];
-      }
-      // Cas 2 — tableau messages[]
-      else if (Array.isArray(p)) {
-        messages = p;
-        tools    = msg.tools || [];
-      }
-      // Cas 3 — string
-      else if (typeof p === "string") {
-        messages = [];
+        body = Object.assign({ model: node.alias || "local", stream: false }, p);
+      } else if (Array.isArray(p)) {
+        body = { model: node.alias || "local", messages: p, stream: false, ...samplingDefaults() };
+      } else {
+        const text = typeof p === "string" ? p : JSON.stringify(p);
+        const messages = [];
         if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
-        messages.push({ role: "user", content: p });
-        tools = msg.tools || [];
-      }
-      else {
-        node.error("Mode mcp-client: msg.payload doit être une string, un tableau messages[], ou un objet { messages: [] }", msg);
-        return;
+        messages.push({ role: "user", content: text });
+        body = { model: node.alias || "local", messages, stream: false, ...samplingDefaults() };
       }
 
-      runMcpLoop(msg, messages, tools);
-    }
-
-    function runMcpLoop(originalMsg, messages, tools) {
+      body.stream = false;
       setStatus("blue", "inferring...");
 
-      const body = {
-        model:    originalMsg.alias || node.alias || "local",
-        messages,
-        ...samplingParams(),
-        stream: false
-      };
-      if (tools.length > 0) body.tools = tools;
-
       httpPost("/v1/chat/completions", body, (err, parsed) => {
-        if (err) {
-          node.error(err.message, originalMsg);
-          setStatus("red", err.message);
-          return;
-        }
-
+        if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
         const choice = parsed.choices && parsed.choices[0];
-        if (!choice) { node.error("Réponse vide du serveur", originalMsg); return; }
+        if (!choice) { node.error("Réponse vide du serveur", msg); return; }
 
-        const assistantMsg = choice.message;
-
-        // ── Appels d'outils détectés
-        if (assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0) {
-          const taskId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-          const updatedMessages = messages.concat([assistantMsg]);
-
-          if (node.autoToolLoop) {
-            // ── Mode automatique : stocker l'état et attendre tool_result
-            node.pendingToolCalls[taskId] = {
-              originalMsg,
-              messages: updatedMessages,
-              tools,
-              pendingCount: assistantMsg.tool_calls.length,
-              toolResults:  []
-            };
-            node.send([null, {
-              topic:   "tool_call",
-              payload: { taskId, tool_calls: assistantMsg.tool_calls }
-            }]);
-            setStatus("yellow", `waiting tool results (${assistantMsg.tool_calls.length})`);
-
-          } else {
-            // ── Mode manuel : émettre et s'arrêter — le flow reprend la main
-            // msg.messages contient l'historique complet pour que le flow
-            // puisse construire le prochain tour et renvoyer au nœud
-            originalMsg.messages = updatedMessages;
-            node.send([null, {
-              topic:   "tool_call",
-              payload: {
-                taskId,
-                tool_calls: assistantMsg.tool_calls,
-                messages:   updatedMessages,   // historique complet pour le flow
-                tools                          // outils originaux, pour les passer au tour suivant
-              }
-            }]);
-            setStatus("green", `ready :${node.serverPort}`);
-          }
-          return;
-        }
-
-        // ── Réponse texte finale
-        originalMsg.payload  = assistantMsg.content || "";
-        originalMsg.messages = messages.concat([assistantMsg]);
-        node.send([originalMsg, null]);
-        setStatus("green", `ready :${node.serverPort}`);
+        msg.payload  = choice.message.content || "";
+        msg.llamacpp = parsed;
+        msg.messages = body.messages.concat([choice.message]);
+        node.send([msg, null]);
+        setStatus("green", statusReadyText());
       });
-    }
-
-    // Réception d'un résultat d'outil (msg.topic = "tool_result")
-    function handleToolResult(msg) {
-      const taskId = msg.payload && msg.payload.taskId;
-      if (!taskId || !node.pendingToolCalls[taskId]) {
-        node.warn("tool_result reçu mais taskId inconnu : " + taskId);
-        return;
-      }
-      const state = node.pendingToolCalls[taskId];
-
-      // Ajouter les résultats à la conversation
-      const results = Array.isArray(msg.payload.results)
-        ? msg.payload.results : [msg.payload.results];
-
-      results.forEach((r) => {
-        state.messages.push({
-          role:         "tool",
-          tool_call_id: r.tool_call_id,
-          content:      typeof r.content === "string" ? r.content : JSON.stringify(r.content)
-        });
-        state.toolResults.push(r);
-      });
-
-      state.pendingCount -= results.length;
-
-      // Si tous les résultats sont reçus → relancer la boucle
-      if (state.pendingCount <= 0) {
-        delete node.pendingToolCalls[taskId];
-        runMcpLoop(state.originalMsg, state.messages, state.tools);
-      } else {
-        setStatus("yellow", `waiting tool results (${state.pendingCount})`);
-      }
     }
 
     // ──────────────────────────────────────────────────────
-    // Dispatch entrée
+    // Dispatch inférence (standalone / master uniquement)
     // ──────────────────────────────────────────────────────
 
     function handleMessage(msg) {
-      if      (node.mode === "chat")       handleChat(msg);
-      else if (node.mode === "mcp-client") handleMcpClient(msg);
-      else if (node.mode === "openai")     handleOpenAIProxy(msg);
-      else                                 handleCompletion(msg);
+      if      (node.mode === "openai") handleOpenAI(msg);
+      else if (node.mode === "chat")   handleChat(msg);
+      else                             handleCompletion(msg);
+    }
+
+    function statusReadyText() {
+      if (node.clusterRole === "master") return `ready :${node.serverPort} [master]`;
+      return `ready :${node.serverPort}`;
     }
 
     // ──────────────────────────────────────────────────────
-    // Mode 4 : proxy OpenAI — pass-through pur
-    // Modèle chargé une fois au deploy, jamais rechargé.
-    // msg.payload = objet requête OpenAI complet → forwardé tel quel
-    // msg.payload = string ou messages[] → wrappé minimalement
-    // Sortie 1 : msg.payload = message complet { role, content, tool_calls? }
-    // ──────────────────────────────────────────────────────
-
-    function handleOpenAIProxy(msg) {
-      let p = msg.payload;
-
-      // Auto-parse si le payload est une string JSON
-      if (typeof p === "string") {
-        try { p = JSON.parse(p); } catch (e) { /* pas du JSON, on garde la string */ }
-      }
-
-      let body;
-
-      // Cas 1 — objet complet { messages, temperature, max_tokens, … } → passé tel quel
-      if (p && typeof p === "object" && !Array.isArray(p) && Array.isArray(p.messages)) {
-        body = Object.assign({ model: node.alias || "local", stream: false }, p);
-
-      // Cas 2 — tableau messages[]
-      } else if (Array.isArray(p)) {
-        body = { model: node.alias || "local", messages: p, stream: false, ...samplingParams() };
-
-      // Cas 3 — string simple
-      } else if (typeof p === "string") {
-        const messages = [];
-        if (node.systemPrompt) messages.push({ role: "system", content: node.systemPrompt });
-        messages.push({ role: "user", content: p });
-        body = { model: node.alias || "local", messages, stream: false, ...samplingParams() };
-
-      } else {
-        node.error("Mode openai: msg.payload doit être un objet { messages[] }, un tableau, ou une string", msg);
-        return;
-      }
-
-      // Forcer stream: false — on ne gère pas le streaming dans Node-RED
-      body.stream = false;
-
-      setStatus("blue", "inferring...");
-      httpPost("/v1/chat/completions", body, (err, parsed) => {
-        if (err) { node.error(err.message, msg); setStatus("red", err.message); return; }
-        const choice = parsed.choices && parsed.choices[0];
-        if (!choice) { node.error("Réponse vide du serveur", msg); return; }
-
-        // msg.payload   = contenu texte de la réponse (usage direct dans le flow)
-        // msg.llamacpp  = réponse API complète (choices, usage, timings, model…)
-        // msg.messages  = historique complet pour le tour suivant
-        msg.payload   = choice.message.content || "";
-        msg.llamacpp  = parsed;
-        msg.messages  = body.messages.concat([choice.message]);
-        node.send([msg, null]);
-        setStatus("green", `ready :${node.serverPort}`);
-      });
-    }
-
-    // ──────────────────────────────────────────────────────
-    // Emitter debug (sortie 2)
+    // Debug info (sortie 2) — branché selon le rôle
     // ──────────────────────────────────────────────────────
 
     function emitDebugInfo(label) {
+      if (node.clusterRole === "worker") {
+        const args = buildRpcArgs();
+        node.send([null, {
+          topic: "debug",
+          payload: {
+            message:     label || "rpc-server ready",
+            clusterRole: "worker",
+            command:     node.rpcBinary + " " + args.join(" "),
+            args,
+            host:        node.rpcHost,
+            port:        node.rpcPort
+          }
+        }]);
+        return;
+      }
+
       const args = buildArgs();
       node.send([null, {
-        topic:   "debug",
+        topic: "debug",
         payload: {
           message:          label || "server ready",
+          clusterRole:      node.clusterRole,
           mode:             node.mode,
           command:          node.llamaBinary + " " + args.join(" "),
           args,
-          samplingDefaults: samplingParams(),
-          port:             node.serverPort
+          samplingDefaults: samplingDefaults(),
+          port:             node.serverPort,
+          ...(node.clusterRole === "master" && { rpcWorkers: parseRpcWorkers(node.rpcWorkers) })
         }
       }]);
     }
 
     // ──────────────────────────────────────────────────────
-    // Démarrage serveur
+    // Démarrage — standalone / master (llama-server)
     // ──────────────────────────────────────────────────────
 
     function markReady() {
       if (node.serverReady) return;
       node.serverReady = true;
-      setStatus("green", `ready :${node.serverPort}`);
-      node.log(`llama-server ready on port ${node.serverPort} [mode: ${node.mode}]`);
+      setStatus("green", statusReadyText());
+      node.log(`llama-server ready [${node.clusterRole}/${node.mode}] :${node.serverPort}`);
       emitDebugInfo("server ready");
       while (node.pendingQueue.length > 0) handleMessage(node.pendingQueue.shift());
     }
 
-    function startServer() {
-      if (!node.modelPath) {
-        setStatus("red", "no model path");
-        node.error("llama-cpp: modelPath is not set.");
-        return;
-      }
-      isPortFree(node.serverPort, (free) => {
-        if (free === false) {
-          const m = `port ${node.serverPort} already in use`;
-          node.error("llama-cpp: " + m);
-          setStatus("red", m);
-          return;
-        }
-        spawnServer();
-      });
-    }
-
     function spawnServer() {
       const args = buildArgs();
-      node.log(`Spawning [${node.mode}]: ${node.llamaBinary} ${args.join(" ")}`);
+      node.log(`Spawn [${node.clusterRole}]: ${node.llamaBinary} ${args.join(" ")}`);
       setStatus("yellow", `loading model :${node.serverPort}...`);
 
       node.serverProcess = spawn(node.llamaBinary, args, {
@@ -591,31 +447,29 @@ module.exports = function (RED) {
       let inTiming = false;
 
       function parseTiming(lines) {
-        const result = { raw: lines.join("\n"), port: node.serverPort };
+        const r = { raw: lines.join("\n"), port: node.serverPort };
         for (const l of lines) {
           let m = l.match(/prompt eval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens.*?([\d.]+)\s*tokens per second/);
-          if (m) { result.promptEvalMs = parseFloat(m[1]); result.promptTokens = parseInt(m[2]); result.promptTokensPerSec = parseFloat(m[3]); }
+          if (m) { r.promptEvalMs = parseFloat(m[1]); r.promptTokens = parseInt(m[2]); r.promptTokensPerSec = parseFloat(m[3]); }
           m = l.match(/^\s*eval time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens.*?([\d.]+)\s*tokens per second/);
-          if (m) { result.evalMs = parseFloat(m[1]); result.evalTokens = parseInt(m[2]); result.evalTokensPerSec = parseFloat(m[3]); }
+          if (m) { r.evalMs = parseFloat(m[1]); r.evalTokens = parseInt(m[2]); r.evalTokensPerSec = parseFloat(m[3]); }
           m = l.match(/total time\s*=\s*([\d.]+)\s*ms\s*\/\s*(\d+)\s*tokens/);
-          if (m) { result.totalMs = parseFloat(m[1]); result.totalTokens = parseInt(m[2]); }
+          if (m) { r.totalMs = parseFloat(m[1]); r.totalTokens = parseInt(m[2]); }
         }
-        return result;
+        return r;
       }
 
       function onData(chunk) {
         const lines = chunk.toString().split("\n");
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
-          if (node.debugTrace) node.warn(`[llama-server:${node.serverPort}] ${trimmed}`);
+          const t = line.trim();
+          if (!t) continue;
+          if (node.debugTrace) node.warn(`[llama-server:${node.serverPort}] ${t}`);
 
-          if (trimmed.includes("print_timing")) {
-            inTiming = true; timingBuffer = [trimmed]; continue;
-          }
+          if (t.includes("print_timing")) { inTiming = true; timingBuffer = [t]; continue; }
           if (inTiming) {
-            timingBuffer.push(trimmed);
-            if (trimmed.includes("all slots are idle")) {
+            timingBuffer.push(t);
+            if (t.includes("all slots are idle")) {
               node.send([null, { topic: "timing", payload: parseTiming(timingBuffer) }]);
               timingBuffer = []; inTiming = false;
             }
@@ -623,13 +477,13 @@ module.exports = function (RED) {
           }
 
           if (!node.serverReady && (
-            trimmed.includes("server is listening") ||
-            trimmed.includes("HTTP server listening") ||
-            trimmed.includes("all slots are idle") ||
-            trimmed.includes("starting the main loop") ||
-            trimmed.includes("llama server listening") ||
-            trimmed.includes("listening on") ||
-            trimmed.includes(String(node.serverPort))
+            t.includes("server is listening") ||
+            t.includes("HTTP server listening") ||
+            t.includes("all slots are idle") ||
+            t.includes("starting the main loop") ||
+            t.includes("llama server listening") ||
+            t.includes("listening on") ||
+            t.includes(String(node.serverPort))
           )) {
             waitForHttp(node.serverPort, 20, (err) => {
               if (err) node.warn("HTTP probe failed: " + err.message);
@@ -642,13 +496,108 @@ module.exports = function (RED) {
       node.serverProcess.stdout.on("data", onData);
       node.serverProcess.stderr.on("data", onData);
       node.serverProcess.on("error", (err) => {
-        node.error("Spawn failed: " + err.message); setStatus("red", "spawn error");
-        node.serverProcess = null; node.serverReady = false;
+        node.error("Spawn failed (" + node.llamaBinary + "): " + err.message);
+        setStatus("red", "spawn error");
+        node.serverProcess = null;
+        node.serverReady   = false;
       });
       node.serverProcess.on("close", (code) => {
         node.log(`llama-server :${node.serverPort} exited (${code})`);
-        node.serverProcess = null; node.serverReady = false;
+        node.serverProcess = null;
+        node.serverReady   = false;
         if (code !== null && code !== 0) setStatus("red", `exited (${code})`);
+      });
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Démarrage — worker (rpc-server)
+    // ──────────────────────────────────────────────────────
+
+    function markReadyWorker() {
+      if (node.serverReady) return;
+      node.serverReady = true;
+      setStatus("green", `RPC ready :${node.rpcPort}`);
+      node.log(`rpc-server ready on ${node.rpcHost}:${node.rpcPort}`);
+      emitDebugInfo("rpc-server ready");
+      // Un worker ne traite jamais de messages d'inférence : pas de drain de queue.
+    }
+
+    function spawnWorker() {
+      const args = buildRpcArgs();
+      node.log(`Spawn [worker]: ${node.rpcBinary} ${args.join(" ")}`);
+      setStatus("yellow", `starting RPC :${node.rpcPort}...`);
+
+      node.serverProcess = spawn(node.rpcBinary, args, {
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+
+      function onData(chunk) {
+        const lines = chunk.toString().split("\n");
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t) continue;
+          if (node.debugTrace) node.warn(`[rpc-server:${node.rpcPort}] ${t}`);
+
+          if (!node.serverReady && t.includes("Starting RPC server")) {
+            waitForTcp(node.rpcHost, node.rpcPort, 20, (err) => {
+              if (err) node.warn("TCP probe failed: " + err.message);
+              else markReadyWorker();
+            });
+          }
+        }
+      }
+
+      node.serverProcess.stdout.on("data", onData);
+      node.serverProcess.stderr.on("data", onData);
+      node.serverProcess.on("error", (err) => {
+        node.error("Spawn failed (" + node.rpcBinary + "): " + err.message);
+        setStatus("red", "spawn error");
+        node.serverProcess = null;
+        node.serverReady   = false;
+      });
+      node.serverProcess.on("close", (code) => {
+        node.log(`rpc-server :${node.rpcPort} exited (${code})`);
+        node.serverProcess = null;
+        node.serverReady   = false;
+        if (code !== null && code !== 0) setStatus("red", `exited (${code})`);
+      });
+    }
+
+    // ──────────────────────────────────────────────────────
+    // Démarrage — dispatch par rôle
+    // ──────────────────────────────────────────────────────
+
+    function startServer() {
+      if (node.clusterRole === "worker") {
+        isPortFree(node.rpcPort, (free) => {
+          if (free === false) {
+            const m = `port RPC ${node.rpcPort} déjà utilisé`;
+            node.error("llama-cpp (worker): " + m);
+            setStatus("red", m);
+            return;
+          }
+          spawnWorker();
+        });
+        return;
+      }
+
+      // standalone / master : nécessite un modèle local
+      if (!node.modelPath) {
+        setStatus("red", "no model path");
+        node.error("llama-cpp: modelPath non défini.");
+        return;
+      }
+      if (node.clusterRole === "master" && parseRpcWorkers(node.rpcWorkers).length === 0) {
+        node.warn("llama-cpp (master): aucun worker RPC configuré — tourne uniquement sur les ressources locales.");
+      }
+      isPortFree(node.serverPort, (free) => {
+        if (free === false) {
+          const m = `port ${node.serverPort} déjà utilisé`;
+          node.error("llama-cpp: " + m);
+          setStatus("red", m);
+          return;
+        }
+        spawnServer();
       });
     }
 
@@ -663,8 +612,11 @@ module.exports = function (RED) {
         node.log(`trace ${node.debugTrace ? "ON" : "OFF"}`);
         return;
       }
-      // Résultat d'outil en retour (mode mcp-client)
-      if (msg.topic === "tool_result") { handleToolResult(msg); return; }
+
+      if (node.clusterRole === "worker") {
+        node.warn("llama-cpp (worker): ce nœud n'exécute pas d'inférence, il expose uniquement ses ressources RPC à un nœud master. Message ignoré.");
+        return;
+      }
 
       if (!node.serverReady) {
         node.pendingQueue.push(msg);
@@ -676,17 +628,24 @@ module.exports = function (RED) {
     });
 
     node.on("close", (done) => {
-      node.serverReady      = false;
-      node.pendingQueue     = [];
-      node.pendingToolCalls = {};
+      node.serverReady  = false;
+      node.pendingQueue = [];
       if (node.serverProcess) {
         node.serverProcess.kill("SIGTERM");
-        const t = setTimeout(() => { if (node.serverProcess) node.serverProcess.kill("SIGKILL"); }, 3000);
-        node.serverProcess.on("close", () => { clearTimeout(t); node.serverProcess = null; done(); });
-      } else { done(); }
+        const t = setTimeout(() => {
+          if (node.serverProcess) node.serverProcess.kill("SIGKILL");
+        }, 3000);
+        node.serverProcess.on("close", () => {
+          clearTimeout(t);
+          node.serverProcess = null;
+          done();
+        });
+      } else {
+        done();
+      }
     });
 
-    // Démarrage immédiat au deploy pour tous les modes
+    // Démarrage immédiat au deploy, quel que soit le rôle
     startServer();
   }
 
